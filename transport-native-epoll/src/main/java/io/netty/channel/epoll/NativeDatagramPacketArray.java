@@ -79,8 +79,9 @@ final class NativeDatagramPacketArray {
         return true;
     }
 
-    void add(ChannelOutboundBuffer buffer, boolean connected) throws Exception {
+    void add(ChannelOutboundBuffer buffer, boolean connected, int maxMessagesPerWrite) throws Exception {
         processor.connected = connected;
+        processor.maxMessagesPerWrite = maxMessagesPerWrite;
         buffer.forEachFlushedMessage(processor);
     }
 
@@ -109,26 +110,33 @@ final class NativeDatagramPacketArray {
 
     private final class MyMessageProcessor implements MessageProcessor {
         private boolean connected;
+        private int maxMessagesPerWrite;
 
         @Override
         public boolean processMessage(Object msg) {
+            final boolean added;
             if (msg instanceof DatagramPacket) {
                 DatagramPacket packet = (DatagramPacket) msg;
                 ByteBuf buf = packet.content();
                 int segmentSize = 0;
-                if (packet instanceof SegmentedDatagramPacket) {
-                    int seg = ((SegmentedDatagramPacket) packet).segmentSize();
+                if (packet instanceof io.netty.channel.unix.SegmentedDatagramPacket) {
+                    int seg = ((io.netty.channel.unix.SegmentedDatagramPacket) packet).segmentSize();
                     // We only need to tell the kernel that we want to use UDP_SEGMENT if there are multiple
                     // segments in the packet.
                     if (buf.readableBytes() > seg) {
                         segmentSize = seg;
                     }
                 }
-                return add0(buf, buf.readerIndex(), buf.readableBytes(), segmentSize, packet.recipient());
-            }
-            if (msg instanceof ByteBuf && connected) {
+                added = add0(buf, buf.readerIndex(), buf.readableBytes(), segmentSize, packet.recipient());
+            } else if (msg instanceof ByteBuf && connected) {
                 ByteBuf buf = (ByteBuf) msg;
-                return add0(buf, buf.readerIndex(), buf.readableBytes(), 0, null);
+                added = add0(buf, buf.readerIndex(), buf.readableBytes(), 0, null);
+            } else {
+                added = false;
+            }
+            if (added) {
+                maxMessagesPerWrite--;
+                return maxMessagesPerWrite > 0;
             }
             return false;
         }
@@ -174,7 +182,7 @@ final class NativeDatagramPacketArray {
             }
         }
 
-        DatagramPacket newDatagramPacket(ByteBuf buffer, InetSocketAddress localAddress) throws UnknownHostException {
+        DatagramPacket newDatagramPacket(ByteBuf buffer, InetSocketAddress recipient) throws UnknownHostException {
             final InetAddress address;
             if (addrLen == ipv4Bytes.length) {
                 System.arraycopy(addr, 0, ipv4Bytes, 0, addrLen);
@@ -182,8 +190,14 @@ final class NativeDatagramPacketArray {
             } else {
                 address = Inet6Address.getByAddress(null, addr, scopeId);
             }
-            return new DatagramPacket(buffer.writerIndex(count),
-                    localAddress, new InetSocketAddress(address, port));
+            InetSocketAddress sender = new InetSocketAddress(address, port);
+            buffer.writerIndex(count);
+
+            // UDP_GRO
+            if (segmentSize > 0) {
+                return new SegmentedDatagramPacket(buffer, segmentSize, recipient, sender);
+            }
+            return new DatagramPacket(buffer, recipient, sender);
         }
     }
 }
